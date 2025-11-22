@@ -1,0 +1,172 @@
+name: Build RevampedFMRadio (Android.mk → debug APK)
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+env:
+  ANDROID_API: "31"
+  BUILD_TOOLS: "31.0.0"
+  NDK_VERSION: "21.4.7075529"   # اگر لازم است عوضش کن
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 11
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '11'
+
+      - name: Install apt packages
+        run: sudo apt-get update && sudo apt-get install -y unzip wget zip
+
+      - name: Prepare Android SDK root
+        run: |
+          mkdir -p ${{ runner.tool_cache }}/android-sdk
+          echo "ANDROID_SDK_ROOT=${{ runner.tool_cache }}/android-sdk" >> $GITHUB_ENV
+      - name: Download commandline tools
+        run: |
+          cd ${{ runner.tool_cache }}
+          wget https://dl.google.com/android/repository/commandlinetools-linux-8512546_latest.zip -O cmdline-tools.zip
+          unzip -q cmdline-tools.zip -d ${{ runner.tool_cache }}/android-sdk
+          mkdir -p ${{ runner.tool_cache }}/android-sdk/cmdline-tools/latest
+          mv ${{ runner.tool_cache }}/android-sdk/tools/* ${{ runner.tool_cache }}/android-sdk/cmdline-tools/latest/ || true
+
+      - name: Install SDK packages (platform-tools, build-tools, platform, ndk)
+        run: |
+          export ANDROID_SDK_ROOT=${{ runner.tool_cache }}/android-sdk
+          yes | $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager --sdk_root=$ANDROID_SDK_ROOT "platform-tools" "platforms;android-${{ env.ANDROID_API }}" "build-tools;${{ env.BUILD_TOOLS }}" "ndk;${{ env.NDK_VERSION }}" > sdk_install.log
+          ls -la $ANDROID_SDK_ROOT
+
+      - name: Add SDK tools to PATH
+        run: |
+          echo "${{ runner.tool_cache }}/android-sdk/platform-tools" >> $GITHUB_PATH
+          echo "${{ runner.tool_cache }}/android-sdk/cmdline-tools/latest/bin" >> $GITHUB_PATH
+          echo "${{ runner.tool_cache }}/android-sdk/build-tools/${{ env.BUILD_TOOLS }}" >> $GITHUB_PATH
+          echo "${{ runner.tool_cache }}/android-sdk/ndk/${{ env.NDK_VERSION }}" >> $GITHUB_PATH
+
+      - name: Build native code with ndk-build (if Android.mk present)
+        run: |
+          export ANDROID_SDK_ROOT=${{ runner.tool_cache }}/android-sdk
+          if [ -f "Android.mk" ]; then
+            echo "Found Android.mk → running ndk-build"
+            $ANDROID_SDK_ROOT/ndk/${{ env.NDK_VERSION }}/ndk-build NDK_PROJECT_PATH=. APP_BUILD_SCRIPT=Android.mk || true
+          else
+            echo "No Android.mk found — skipping ndk-build"
+          fi
+
+      - name: Compile resources with aapt2 and generate R.java
+        run: |
+          export ANDROID_SDK_ROOT=${{ runner.tool_cache }}/android-sdk
+          mkdir -p build/gen
+          # compile all res/ into flat files
+          if [ -d "res" ]; then
+            find res -type f | grep -E "\.(xml|png|jpg|9.png|webp)$" >/dev/null 2>&1 && \
+            $ANDROID_SDK_ROOT/build-tools/${{ env.BUILD_TOOLS }}/aapt2 compile --dir res -o build/res-compiled.zip || true
+            # link to produce .ap_ and generate R.java into build/gen
+            $ANDROID_SDK_ROOT/build-tools/${{ env.BUILD_TOOLS }}/aapt2 link -o build/fmradio.ap_ \
+              --manifest AndroidManifest.xml \
+              -I $ANDROID_SDK_ROOT/platforms/android-${{ env.ANDROID_API }}/android.jar \
+              --java build/gen build/res-compiled.zip || true
+          else
+            echo "No res/ directory found — continuing (project may not have resources)"
+          fi
+
+      - name: Compile Java sources
+        run: |
+          export ANDROID_SDK_ROOT=${{ runner.tool_cache }}/android-sdk
+          mkdir -p build/classes
+          # collect java sources from src/ and generated R.java
+          srcs=$(find src -name '*.java' 2>/dev/null || true)
+          gen_srcs=$(find build/gen -name '*.java' 2>/dev/null || true)
+          allsrc=""
+          for f in $srcs $gen_srcs; do
+            if [ -n "$f" ]; then
+              allsrc="$allsrc $f"
+            fi
+          done
+          if [ -z "$allsrc" ]; then
+            echo "No Java source files found in src/ or build/gen — aborting."
+            exit 1
+          fi
+          javac -encoding UTF-8 -source 1.8 -target 1.8 -bootclasspath $ANDROID_SDK_ROOT/platforms/android-${{ env.ANDROID_API }}/android.jar -classpath $ANDROID_SDK_ROOT/platforms/android-${{ env.ANDROID_API }}/android.jar -d build/classes $allsrc
+
+      - name: Convert .class → classes.dex (d8)
+        run: |
+          export ANDROID_SDK_ROOT=${{ runner.tool_cache }}/android-sdk
+          mkdir -p build/dex
+          $ANDROID_SDK_ROOT/build-tools/${{ env.BUILD_TOOLS }}/d8 --output build/dex build/classes || true
+          if [ ! -f build/dex/classes.dex ]; then
+            echo "classes.dex not found — check d8 output"
+            exit 1
+          fi
+
+      - name: Package APK (merge resources + classes.dex)
+        run: |
+          export ANDROID_SDK_ROOT=${{ runner.tool_cache }}/android-sdk
+          # start from resource package (fmradio.ap_) if present, otherwise create minimal apk
+          if [ -f build/fmradio.ap_ ]; then
+            cp build/fmradio.ap_ build/unsigned_unaligned.apk
+          else
+            # create minimal apk container
+            $ANDROID_SDK_ROOT/build-tools/${{ env.BUILD_TOOLS }}/aapt package -f -M AndroidManifest.xml -S res -I $ANDROID_SDK_ROOT/platforms/android-${{ env.ANDROID_API }}/android.jar -F build/unsigned_unaligned.apk || true
+          fi
+          # add classes.dex
+          cd build
+          zip -g unsigned_unaligned.apk dex/classes.dex
+          cd ..
+          # zipalign
+          $ANDROID_SDK_ROOT/build-tools/${{ env.BUILD_TOOLS }}/zipalign -f 4 build/unsigned_unaligned.apk build/fmradio-aligned.apk
+
+      - name: Create debug keystore and sign APK (debug)
+        run: |
+          export ANDROID_SDK_ROOT=${{ runner.tool_cache }}/android-sdk
+          mkdir -p build/keystore
+          keypath=build/keystore/debug.keystore
+          if [ ! -f "$keypath" ]; then
+            keytool -genkeypair -v -storepass android -keypass android -keystore $keypath -alias androiddebugkey -dname "CN=Android Debug,O=Android,C=US" -keyalg RSA -keysize 2048 -validity 10000
+          fi
+          $ANDROID_SDK_ROOT/build-tools/${{ env.BUILD_TOOLS }}/apksigner sign --ks $keypath --ks-pass pass:android --key-pass pass:android build/fmradio-aligned.apk
+
+      - name: Verify signed APK
+        run: |
+          export ANDROID_SDK_ROOT=${{ runner.tool_cache }}/android-sdk
+          $ANDROID_SDK_ROOT/build-tools/${{ env.BUILD_TOOLS }}/apksigner verify build/fmradio-aligned.apk || true
+          ls -lh build/fmradio-aligned.apk
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: RevampedFMRadio-debug-apk
+          path: build/fmradio-aligned.apk
+
+      - name: Create GitHub Release (if run from tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref_name }}
+          release_name: Release ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+
+      - name: Upload APK to GitHub Release (if release created)
+        if: steps.create_release.outputs.upload_url != ''
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: build/fmradio-aligned.apk
+          asset_name: RevampedFMRadio-${{ github.ref_name }}-debug.apk
+          asset_content_type: application/vnd.android.package-archive
