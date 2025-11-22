@@ -1,0 +1,69 @@
+name: Build Revamped FM Radio APK
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      # نصب SDK و ابزارهای build داخلی AOSP
+      - name: Install Android build tools
+        run: |
+          sudo apt update
+          sudo apt install -y openjdk-17-jdk android-sdk android-sdk-platform-23 \
+            apksigner zipalign
+
+      - name: Set JAVA_HOME
+        run: echo "JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64" >> $GITHUB_ENV
+
+      # ساخت ساختار خروجی
+      - name: Prepare build directories
+        run: |
+          mkdir -p out/classes
+          mkdir -p out/res
+          mkdir -p out/apk
+
+      # کامپایل جاوا
+      - name: Compile Java sources
+        run: |
+          find src -name "*.java" > sources.txt
+          javac -d out/classes @sources.txt
+
+      # کپی منابع
+      - name: Copy Android resources
+        run: cp -r res out/res
+
+      # ساخت DEX
+      - name: Convert to DEX
+        run: |
+          d8 out/classes --output out/classes.dex
+
+      # ساخت AndroidManifest.xml نهایی با پکیج درست
+      - name: Generate Manifest
+        run: |
+          sed "s/package=\".*\"/package=\"com.android.fmradio\"/" AndroidManifest.xml > out/AndroidManifest.xml
+
+      # ساخت APK خام
+      - name: Create raw APK
+        run: |
+          cd out
+          zip -r unsigned.apk classes.dex res AndroidManifest.xml
+
+      # امضا
+      - name: Sign APK (debug)
+        run: |
+          apksigner sign --ks-type debug --out out/FMRadio-debug.apk out/unsigned.apk
+
+      # آپلود آرتیفکت با نسخهٔ جدید (v4)
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FMRadio-debug
+          path: out/FMRadio-debug.apk
