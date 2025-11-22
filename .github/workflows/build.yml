@@ -1,0 +1,55 @@
+name: Build FM Radio APK
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install build tools + platform
+        run: |
+          sdkmanager "platform-tools" "platforms;android-33" "build-tools;33.0.2"
+
+      - name: Compile Java (with android.jar)
+        run: |
+          mkdir -p out/classes
+          find src -name "*.java" > sources.txt
+          javac -bootclasspath $ANDROID_HOME/platforms/android-33/android.jar \
+                -classpath $ANDROID_HOME/platforms/android-33/android.jar \
+                -d out/classes \
+                @sources.txt
+
+      - name: DEX
+        run: |
+          mkdir -p out/dex
+          d8 out/classes --output out/dex
+
+      - name: Build APK structure
+        run: |
+          mkdir -p out/apk
+          cp -r res out/apk/res
+          cp AndroidManifest.xml out/apk
+          cp out/dex/classes.dex out/apk
+
+      - name: Package unsigned APK
+        run: |
+          cd out/apk
+          zip -r ../unsigned.apk .
+
+      - name: Sign APK
+        run: |
+          apksigner sign --ks-type debug --out FMRadio-debug.apk out/unsigned.apk
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FMRadio-debug
+          path: FMRadio-debug.apk
